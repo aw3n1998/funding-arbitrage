@@ -25,6 +25,9 @@ EXCHANGE_DISPLAY_NAMES = {
     "bitget": "Bitget",
 }
 
+# 所有默认要初始化的交易所（支持公开数据模式）
+ALL_EXCHANGES = list(EXCHANGE_CLASS_MAP.keys())
+
 
 class ExchangeManager:
     """管理多个交易所的连接与基础操作"""
@@ -35,13 +38,18 @@ class ExchangeManager:
         self._initialized = False
 
     async def initialize(self) -> None:
-        """初始化所有交易所连接"""
-        if not self.config.exchanges:
-            logger.warning("未配置任何交易所 API，运行在公开数据模式")
-
+        """初始化所有交易所连接（有 API Key 用私有模式，否则用公开数据模式）"""
         init_tasks = []
+
+        # 已配置 API Key 的交易所（私有模式）
+        configured_ccxt_names = {cfg.name for cfg in self.config.exchanges.values()}
         for exchange_id, exchange_config in self.config.exchanges.items():
             init_tasks.append(self._init_exchange(exchange_id, exchange_config))
+
+        # 未配置 API Key 的交易所（公开数据模式，仅查询费率）
+        for ccxt_name in ALL_EXCHANGES:
+            if ccxt_name not in configured_ccxt_names:
+                init_tasks.append(self._init_public_exchange(ccxt_name))
 
         await asyncio.gather(*init_tasks, return_exceptions=True)
         self._initialized = True
@@ -76,6 +84,26 @@ class ExchangeManager:
             logger.info(f"✓ {display} 连接成功，共加载 {len(exchange.markets)} 个市场")
         except Exception as e:
             logger.error(f"✗ {ccxt_id} 连接失败: {e}")
+
+    async def _init_public_exchange(self, ccxt_name: str) -> None:
+        """以公开数据模式初始化交易所（无需 API Key，只读费率）"""
+        exchange_class = EXCHANGE_CLASS_MAP.get(ccxt_name)
+        if exchange_class is None:
+            return
+
+        params: Dict = {
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        }
+
+        try:
+            exchange = exchange_class(params)
+            await exchange.load_markets()
+            self.exchanges[ccxt_name] = exchange
+            display = EXCHANGE_DISPLAY_NAMES.get(ccxt_name, ccxt_name)
+            logger.info(f"✓ {display} 公开数据模式连接成功（只读，不可交易）")
+        except Exception as e:
+            logger.warning(f"✗ {ccxt_name} 公开模式连接失败: {e}")
 
     async def close(self) -> None:
         """关闭所有连接"""

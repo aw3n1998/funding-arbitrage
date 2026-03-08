@@ -213,34 +213,76 @@ class ArbitrageBot:
 # ──────────────── 命令行工具 ────────────────
 
 async def run_monitor_only(config: AppConfig) -> None:
-    """仅监控模式：只打印费率表，不交易"""
+    """仅监控模式：打印费率表和套利机会，不交易"""
     em = ExchangeManager(config)
     await em.initialize()
 
     monitor = FundingMonitor(config, em)
+    detector = ArbitrageDetector(config, monitor)
+
     logger.info("获取费率数据中...")
     await monitor.fetch_once()
 
-    matrix = monitor.get_rate_matrix()
     exchanges = em.list_exchanges()
-    headers = ["合约"] + [ex.upper() for ex in exchanges] + ["年化差"]
-    rows = []
 
-    for symbol, rate_row in matrix:
-        row = [symbol]
-        rates = []
-        for ex in exchanges:
-            r = rate_row.get(ex)
-            if r is not None:
-                row.append(f"{r*100:+.3f}%")
-                rates.append(r)
-            else:
-                row.append("-")
-        spread = max(rates) - min(rates) if len(rates) >= 2 else 0
-        row.append(f"{spread*100:.2f}%")
-        rows.append(row)
+    # ── 费率对比表 ──
+    matrix = monitor.get_rate_matrix()
+    if matrix:
+        headers = ["合约"] + [ex.upper() for ex in exchanges] + ["年化差"]
+        rows = []
+        for symbol, rate_row in matrix:
+            row = [symbol]
+            rates = []
+            for ex in exchanges:
+                r = rate_row.get(ex)
+                if r is not None:
+                    row.append(f"{r*100:+.3f}%")
+                    rates.append(r)
+                else:
+                    row.append("-")
+            spread = max(rates) - min(rates) if len(rates) >= 2 else 0
+            row.append(f"{spread*100:.2f}%")
+            rows.append(row)
 
-    print("\n" + tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+        print(f"\n{'='*80}")
+        print(f"  各交易所资金费率对比  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+        print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+    else:
+        print("\n暂无费率数据，请检查网络或白名单配置")
+
+    # ── 套利机会 ──
+    print(f"\n{'='*80}")
+    print(f"  套利机会扫描  (最低年化阈值: {config.arbitrage.min_annual_rate_diff*100:.1f}%)")
+    print("="*80)
+
+    opportunities = detector.scan_opportunities()
+    if opportunities:
+        opp_headers = ["合约", "做空交易所", "做空费率", "做多交易所", "做多费率", "年化差", "净年化(扣费)", "时收益(USDT)"]
+        opp_rows = []
+        for opp in opportunities:
+            opp_rows.append([
+                opp.symbol,
+                opp.short_exchange.upper(),
+                f"{opp.short_rate.funding_rate*100:+.4f}%",
+                opp.long_exchange.upper(),
+                f"{opp.long_rate.funding_rate*100:+.4f}%",
+                f"{opp.annual_rate_spread*100:.2f}%",
+                f"{opp.net_annual_rate*100:.2f}%",
+                f"{opp.estimated_hourly_pnl:.4f}",
+            ])
+        print(tabulate(opp_rows, headers=opp_headers, tablefmt="rounded_outline"))
+        print(f"\n共发现 {len(opportunities)} 个套利机会")
+    else:
+        print(f"\n暂无满足条件的套利机会（年化差 > {config.arbitrage.min_annual_rate_diff*100:.1f}%）")
+        if matrix:
+            # 显示最高年化差供参考
+            best = matrix[0]
+            symbol, rate_row = best
+            valid = [r for r in rate_row.values() if r is not None]
+            if len(valid) >= 2:
+                best_spread = (max(valid) - min(valid)) * 100
+                print(f"当前最大年化差: {symbol} {best_spread:.2f}%")
+
     await em.close()
 
 
@@ -251,8 +293,8 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["bot", "scan"],
-        default="bot",
-        help="bot=运行套利机器人, scan=一次性扫描费率",
+        default="scan",
+        help="bot=运行套利机器人(需要API Key), scan=一次性扫描费率和套利机会(无需API Key)",
     )
     args = parser.parse_args()
 
