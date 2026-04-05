@@ -27,7 +27,7 @@ def setup_logger(log_level: str = "INFO", log_dir: str = "logs") -> None:
 
     # 文件输出（按日期滚动）
     logger.add(
-        f"{log_dir}/arbitrage_{{time:YYYY-MM-DD}}.log",
+        f"{log_dir}/po3_{{time:YYYY-MM-DD}}.log",
         level="DEBUG",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} | {message}",
         rotation="00:00",

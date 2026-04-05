@@ -1,8 +1,7 @@
 """
-全局配置文件
+PO3/AMD 剥头皮策略 — 全局配置
 """
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
 import os
 from dotenv import load_dotenv
 
@@ -10,118 +9,59 @@ load_dotenv()
 
 
 @dataclass
-class ExchangeConfig:
-    """单个交易所配置"""
-    name: str
-    api_key: str
-    api_secret: str
-    passphrase: Optional[str] = None   # Gate/Bitget/OKX 需要
-    sandbox: bool = False
+class PO3Config:
+    # ── 交易所连接 ──
+    exchange: str = "binance"       # "binance" | "bybit"
+    testnet: bool = True
+    api_key: str = ""
+    api_secret: str = ""
+    symbol: str = "BTC/USDT:USDT"
+    leverage: int = 30              # 25~40
 
+    # ── 风险控制 ──
+    risk_per_trade: float = 0.01    # 每笔风险占账户净值比例 (1%)
+    max_daily_trades: int = 10      # 每日最大交易次数
+    max_daily_loss: float = 0.06    # 每日最大亏损比例 (6%)
 
-@dataclass
-class ArbitrageConfig:
-    """套利策略配置"""
-    # 最小年化收益率阈值（0.01 = 1%）
-    min_annual_rate_diff: float = 0.05
-    # 单次套利最大仓位 USDT
-    max_position_usdt: float = 500.0
-    # 最小仓位 USDT
-    min_position_usdt: float = 50.0
-    # 杠杆倍数
-    leverage: int = 1
-    # 平仓触发条件：费率差低于此值时平仓（年化）
-    close_rate_threshold: float = 0.01
-    # 最大同时持有套利对数
-    max_concurrent_positions: int = 5
-    # 监控的交易对白名单（空表示监控所有）
-    symbol_whitelist: List[str] = field(default_factory=lambda: [
-        "BTC/USDT:USDT",
-        "ETH/USDT:USDT",
-        "SOL/USDT:USDT",
-        "BNB/USDT:USDT",
-        "XRP/USDT:USDT",
-        "DOGE/USDT:USDT",
-        "ADA/USDT:USDT",
-        "AVAX/USDT:USDT",
-    ])
-    # 滑点容忍（0.001 = 0.1%）
-    slippage_tolerance: float = 0.001
-    # 单边手续费率（保守估计）
-    taker_fee_rate: float = 0.0005
+    # ── 止盈止损 ──
+    tp1_rr: float = 2.2             # 第一目标 RR（平仓 tp1_close_pct 比例）
+    tp2_rr: float = 3.0             # 第二目标 RR（trailing stop 跟踪剩余仓位）
+    tp1_close_pct: float = 0.5      # 到达 TP1 时平仓 50%
+    sl_atr_buffer: float = 0.2      # SL 在 manipulation 极值外侧 ATR*0.2
 
+    # ── PO3 检测参数 ──
+    acc_bars: int = 10              # 累积阶段识别所需最小 K 线数
+    acc_atr_mult: float = 1.5       # 累积区间高度需 < ATR(14) * 此值
+    manip_atr_mult: float = 0.5     # 假突破需超出 range 边界 ATR*此值
 
-@dataclass
-class MonitorConfig:
-    """监控配置"""
-    # 费率刷新间隔（秒）
-    rate_refresh_interval: int = 10
-    # 持仓状态刷新间隔（秒）
-    position_refresh_interval: int = 30
-    # 是否开启桌面通知
-    enable_notification: bool = True
+    # ── 轮询间隔（秒）──
+    poll_interval_15m: int = 30     # 15m 图扫描间隔
+    poll_interval_1m: int = 5       # 1m 图候信扫描间隔
 
-
-@dataclass
-class AppConfig:
-    """应用总配置"""
-    exchanges: Dict[str, ExchangeConfig] = field(default_factory=dict)
-    arbitrage: ArbitrageConfig = field(default_factory=ArbitrageConfig)
-    monitor: MonitorConfig = field(default_factory=MonitorConfig)
-    # 是否真实交易（False = 仅监控，不下单）
-    live_trading: bool = False
-    # 日志级别
+    # ── 日志 ──
     log_level: str = "INFO"
 
 
-def load_config() -> AppConfig:
+def load_config() -> PO3Config:
     """从环境变量加载配置"""
-    config = AppConfig()
-
-    # 币安
-    if os.getenv("BINANCE_API_KEY"):
-        config.exchanges["binance"] = ExchangeConfig(
-            name="binance",
-            api_key=os.getenv("BINANCE_API_KEY", ""),
-            api_secret=os.getenv("BINANCE_API_SECRET", ""),
-        )
-
-    # 欧意 OKX
-    if os.getenv("OKX_API_KEY"):
-        config.exchanges["okx"] = ExchangeConfig(
-            name="okx",
-            api_key=os.getenv("OKX_API_KEY", ""),
-            api_secret=os.getenv("OKX_API_SECRET", ""),
-            passphrase=os.getenv("OKX_PASSPHRASE", ""),
-        )
-
-    # Gate
-    if os.getenv("GATE_API_KEY"):
-        config.exchanges["gate"] = ExchangeConfig(
-            name="gateio",
-            api_key=os.getenv("GATE_API_KEY", ""),
-            api_secret=os.getenv("GATE_API_SECRET", ""),
-        )
-
-    # Bitget
-    if os.getenv("BITGET_API_KEY"):
-        config.exchanges["bitget"] = ExchangeConfig(
-            name="bitget",
-            api_key=os.getenv("BITGET_API_KEY", ""),
-            api_secret=os.getenv("BITGET_API_SECRET", ""),
-            passphrase=os.getenv("BITGET_PASSPHRASE", ""),
-        )
-
-    # 套利参数
-    config.arbitrage.min_annual_rate_diff = float(
-        os.getenv("MIN_ANNUAL_RATE_DIFF", "0.05"))
-    config.arbitrage.max_position_usdt = float(
-        os.getenv("MAX_POSITION_USDT", "500"))
-    config.arbitrage.leverage = int(os.getenv("LEVERAGE", "1"))
-    config.arbitrage.max_concurrent_positions = int(
-        os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
-
-    config.live_trading = os.getenv("LIVE_TRADING", "false").lower() == "true"
-    config.log_level = os.getenv("LOG_LEVEL", "INFO")
-
-    return config
+    return PO3Config(
+        exchange=os.getenv("PO3_EXCHANGE", "binance"),
+        testnet=os.getenv("PO3_TESTNET", "true").lower() == "true",
+        api_key=os.getenv("PO3_API_KEY", ""),
+        api_secret=os.getenv("PO3_API_SECRET", ""),
+        symbol=os.getenv("PO3_SYMBOL", "BTC/USDT:USDT"),
+        leverage=int(os.getenv("PO3_LEVERAGE", "30")),
+        risk_per_trade=float(os.getenv("PO3_RISK_PER_TRADE", "0.01")),
+        max_daily_trades=int(os.getenv("PO3_MAX_DAILY_TRADES", "10")),
+        max_daily_loss=float(os.getenv("PO3_MAX_DAILY_LOSS", "0.06")),
+        tp1_rr=float(os.getenv("PO3_TP1_RR", "2.2")),
+        tp2_rr=float(os.getenv("PO3_TP2_RR", "3.0")),
+        tp1_close_pct=float(os.getenv("PO3_TP1_CLOSE_PCT", "0.5")),
+        sl_atr_buffer=float(os.getenv("PO3_SL_ATR_BUFFER", "0.2")),
+        acc_bars=int(os.getenv("PO3_ACC_BARS", "10")),
+        acc_atr_mult=float(os.getenv("PO3_ACC_ATR_MULT", "1.5")),
+        manip_atr_mult=float(os.getenv("PO3_MANIP_ATR_MULT", "0.5")),
+        poll_interval_15m=int(os.getenv("PO3_POLL_15M", "30")),
+        poll_interval_1m=int(os.getenv("PO3_POLL_1M", "5")),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
