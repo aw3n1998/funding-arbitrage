@@ -1,15 +1,15 @@
 """
-PO3 交易执行器
+PO3 交易执行器（仅支持 Bitget 永续合约）
+
+修复记录：
+  - [BUG2]  SL 挂单失败后立即市价平仓，不留裸仓
+  - [BUG3]  Bitget 专用止损单参数（triggerPrice + stop_market）
+  - [BUG4]  PnL 计算：TP1 和最终平仓分别按各自的 contracts 计算，不重复
+  - [BUG8]  移除热循环内动态 import
+  - 架构简化：移除内部 _trailing_task，trailing 由主循环调用 tick() 驱动
 
 状态机：
     IDLE → ENTERING → IN_POSITION → PARTIAL_EXIT → CLOSED
-
-职责：
-1. 入场：市价单开仓
-2. 挂 SL 止损单（stop-market）
-3. 挂 TP1 限价单（50% 仓位）
-4. TP2 Trailing Stop 管理（轮询调整 SL 单）
-5. 持仓监控与平仓处理
 """
 import asyncio
 import uuid
@@ -18,10 +18,10 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-import ccxt.async_support as ccxt
+import ccxt.pro as ccxtpro
 from loguru import logger
 
-from po3.detector import EntrySignal, ManipulationEvent
+from po3.detector import EntrySignal, ManipulationEvent, PO3Detector
 from po3.risk_manager import RiskManager, TradeRecord
 from po3.logger import TradeLogger
 
@@ -30,7 +30,7 @@ class PositionState(str, Enum):
     IDLE = "idle"
     ENTERING = "entering"
     IN_POSITION = "in_position"
-    PARTIAL_EXIT = "partial_exit"   # TP1 已成交，剩余仓位在 trailing
+    PARTIAL_EXIT = "partial_exit"   # TP1 已成交，剩余仓位 trailing
     CLOSED = "closed"
 
 
@@ -42,36 +42,49 @@ class ActivePosition:
     symbol: str
     entry_price: float
     contracts_total: float          # 开仓总张数
-    contracts_remaining: float      # 当前剩余张数
+    contracts_remaining: float      # TP1 后剩余张数
     stop_loss: float
     tp1: float
     tp2: float
-    sl_order_id: Optional[str]      # 交易所 SL 订单 ID
-    tp1_order_id: Optional[str]     # 交易所 TP1 限价单 ID
+    sl_order_id: Optional[str]
+    tp1_order_id: Optional[str]
     manipulation: ManipulationEvent
     opened_at: datetime = field(default_factory=datetime.now)
     state: PositionState = PositionState.IN_POSITION
-    trailing_sl: Optional[float] = None   # trailing stop 当前价位
+    trailing_sl: Optional[float] = None
+    # [BUG4] 分别记录两段 PnL
+    tp1_pnl: float = 0.0            # TP1 成交时锁定的 PnL
+    realized_pnl: float = 0.0       # 最终关闭 PnL（仅 contracts_remaining 部分）
 
 
 class PO3Executor:
     """
-    PO3 策略执行器
+    Bitget 永续合约 PO3 执行器
 
-    支持：
-    - Binance / Bybit 永续合约
-    - Testnet 模式
-    - Dry run 模式（不真实下单）
+    Trailing Stop 由外部（main.py）调用 tick(price, atr) 驱动，
+    不再使用内部后台 Task，避免循环依赖和热循环 import。
     """
 
-    # 各交易所平仓参数
-    _CLOSE_PARAMS = {
-        "binance": {"reduceOnly": True},
-        "bybit":   {"reduceOnly": True},
+    # [BUG3] Bitget 专用止损单参数
+    _BITGET_STOP_PARAMS = {
+        "triggerType": "fill_price",    # fill_price（最新价触发）| mark_price
+        "reduceOnly": True,
+        "marginMode": "isolated",
+    }
+    # Bitget 平仓通用参数
+    _BITGET_CLOSE_PARAMS = {
+        "reduceOnly": True,
+        "marginMode": "isolated",
     }
 
-    def __init__(self, exchange: ccxt.Exchange, config, risk_manager: RiskManager,
-                 trade_logger: TradeLogger, dry_run: bool = False):
+    def __init__(
+        self,
+        exchange: ccxtpro.Exchange,
+        config,
+        risk_manager: RiskManager,
+        trade_logger: TradeLogger,
+        dry_run: bool = False,
+    ):
         self.exchange = exchange
         self.cfg = config
         self.risk = risk_manager
@@ -79,7 +92,6 @@ class PO3Executor:
         self.dry_run = dry_run
         self.position: Optional[ActivePosition] = None
         self.state: PositionState = PositionState.IDLE
-        self._trailing_task: Optional[asyncio.Task] = None
 
     # ──────────────────── 入场 ────────────────────
 
@@ -94,11 +106,11 @@ class PO3Executor:
         1. 计算仓位
         2. 设置杠杆
         3. 市价开仓
-        4. 挂 SL 止损单
+        4. 挂 SL 止损单；[BUG2] 失败则立即市价平仓
         5. 挂 TP1 限价单
         """
         if self.state != PositionState.IDLE:
-            logger.warning(f"[EXE] 当前状态 {self.state}，跳过入场")
+            logger.warning(f"[EXE] 状态 {self.state}，跳过入场")
             return False
 
         direction = signal.direction
@@ -107,7 +119,6 @@ class PO3Executor:
             entry, signal.manipulation.extreme, atr, direction
         )
         contracts = self.risk.calculate_position_size(equity, entry, sl)
-
         if contracts <= 0:
             logger.error("[EXE] 仓位为0，中止入场")
             return False
@@ -128,7 +139,7 @@ class PO3Executor:
         entry_order = await self._place_market_order(side, contracts)
         if entry_order is None and not self.dry_run:
             self.state = PositionState.IDLE
-            logger.error("[EXE] 市价开仓失败")
+            logger.error("[EXE] 市价开仓失败，中止")
             return False
 
         actual_entry = (
@@ -136,12 +147,20 @@ class PO3Executor:
             if entry_order else entry
         )
 
-        # ── 3. 挂 SL 止损单 ──
+        # ── 3. 挂 SL 止损单（[BUG2] 失败则立即平仓）──
         sl_order_id = await self._place_sl_order(direction, contracts, sl)
+        if sl_order_id is None and not self.dry_run:
+            logger.critical("[EXE] SL 挂单失败！立即市价平仓，不留裸仓")
+            await self._emergency_market_close(direction, contracts)
+            self.state = PositionState.IDLE
+            return False
 
         # ── 4. 挂 TP1 限价单（50% 仓位）──
         tp1_contracts = round(contracts * self.cfg.tp1_close_pct, 4)
         tp1_order_id = await self._place_tp1_order(direction, tp1_contracts, tp1)
+        # TP1 挂单失败不致命：可以靠 trailing 完成，记录 warning
+        if tp1_order_id is None and not self.dry_run:
+            logger.warning("[EXE] TP1 挂单失败，将完全依赖 trailing stop")
 
         # ── 记录持仓 ──
         self.position = ActivePosition(
@@ -174,117 +193,94 @@ class PO3Executor:
         self.risk.record_trade_open(record)
         self.tlog.log_entry(self.position, signal, equity, atr)
 
-        # ── 5. 启动 Trailing Stop 后台任务 ──
-        self._trailing_task = asyncio.create_task(
-            self._manage_trailing_stop(), name="trailing_stop"
-        )
-
         logger.info(f"[EXE] 入场完成 trade_id={trade_id}")
         return True
 
-    # ──────────────────── Trailing Stop ──────────────────
+    # ──────────────────── 持仓 Tick（由主循环每 5s 调用）────────────────────
 
-    async def _manage_trailing_stop(self) -> None:
+    async def tick(self, current_price: float, current_atr: float) -> None:
         """
-        后台任务：监控持仓，调整 trailing stop。
-
-        逻辑：
-        - TP1 成交后激活 trailing
-        - 每 poll_interval_1m 秒更新一次
-        - ATR 动态计算 trail 距离（ATR * 1.5）
-        - 持续向有利方向移动 SL，不可回退
+        主循环每隔 poll_interval_1m 秒调用一次。
+        传入最新价格和 1m ATR，负责：
+          1. 检查 TP1 是否成交
+          2. 检查 SL 是否触发
+          3. 更新 trailing stop（仅在 TP1 成交后）
         """
-        pos = self.position
-        if pos is None:
+        if self.position is None or self.state == PositionState.IDLE:
             return
 
-        logger.info("[TRAIL] Trailing stop 监控已启动")
+        pos = self.position
 
-        while self.state in (PositionState.IN_POSITION, PositionState.PARTIAL_EXIT):
-            try:
-                await asyncio.sleep(self.cfg.poll_interval_1m)
+        # ── 1. 检查 TP1 是否成交 ──
+        if self.state == PositionState.IN_POSITION and pos.tp1_order_id:
+            tp1_filled = await self._check_order_filled(pos.tp1_order_id)
+            if tp1_filled:
+                await self._on_tp1_filled(pos)
 
-                if self.position is None:
-                    break
+        # ── 2. 检查 SL 是否触发 ──
+        if pos.sl_order_id:
+            sl_filled = await self._check_order_filled(pos.sl_order_id)
+            if sl_filled:
+                logger.warning(f"[EXE] SL 触发 @ {pos.stop_loss:.2f}")
+                await self._on_position_closed("sl", pos.stop_loss, pos.contracts_remaining)
+                return
 
-                # 检查 TP1 是否已成交
-                if (self.state == PositionState.IN_POSITION
-                        and pos.tp1_order_id):
-                    filled = await self._check_order_filled(pos.tp1_order_id)
-                    if filled:
-                        remaining = round(
-                            pos.contracts_total * (1 - self.cfg.tp1_close_pct), 4
-                        )
-                        pos.contracts_remaining = remaining
-                        self.state = PositionState.PARTIAL_EXIT
-                        logger.info(
-                            f"[TRAIL] TP1 已成交 @ {pos.tp1:.2f} "
-                            f"剩余仓位: {remaining} 张"
-                        )
-                        self.tlog.log_tp1(pos)
+        # ── 3. Trailing Stop（TP1 成交后激活）──
+        if self.state == PositionState.PARTIAL_EXIT:
+            await self._update_trailing(pos, current_price, current_atr)
 
-                # 检查 SL 是否触发（持仓已被平）
-                if pos.sl_order_id:
-                    sl_filled = await self._check_order_filled(pos.sl_order_id)
-                    if sl_filled:
-                        logger.warning(
-                            f"[TRAIL] SL 已触发 @ {pos.stop_loss:.2f}"
-                        )
-                        await self._on_position_closed("sl", pos.stop_loss)
-                        break
+            # 检查是否达到 TP2 目标
+            if pos.direction == "long" and current_price >= pos.tp2:
+                logger.info(f"[EXE] 达到 TP2 {pos.tp2:.2f}，平仓剩余")
+                await self._close_remaining(pos, current_price, "tp2")
+            elif pos.direction == "short" and current_price <= pos.tp2:
+                logger.info(f"[EXE] 达到 TP2 {pos.tp2:.2f}，平仓剩余")
+                await self._close_remaining(pos, current_price, "tp2")
 
-                # ── Trailing Stop 更新 ──
-                if self.state == PositionState.PARTIAL_EXIT:
-                    ticker = await self._fetch_ticker()
-                    if ticker is None:
-                        continue
-                    current_price = float(ticker["last"])
+    # ──────────────────── Trailing Stop ────────────────────
 
-                    # 用 1m 图 ATR 动态计算 trail 距离
-                    from po3.detector import PO3Detector
-                    df_1m = await self._fetch_ohlcv("1m", 20)
-                    atr = PO3Detector.get_current_atr(df_1m) if df_1m is not None else 0
-                    trail_dist = atr * 1.5 if atr > 0 else pos.stop_loss * 0.005
+    async def _on_tp1_filled(self, pos: ActivePosition) -> None:
+        """TP1 成交：记录 PnL，更新剩余仓位，激活 trailing"""
+        # [BUG4] TP1 PnL 只算 tp1_close_pct 的那部分仓位
+        tp1_contracts = round(pos.contracts_total * self.cfg.tp1_close_pct, 4)
+        if pos.direction == "long":
+            pos.tp1_pnl = (pos.tp1 - pos.entry_price) * tp1_contracts
+        else:
+            pos.tp1_pnl = (pos.entry_price - pos.tp1) * tp1_contracts
 
-                    if pos.direction == "long":
-                        new_trail = current_price - trail_dist
-                        # 只向上移动，不后退
-                        if pos.trailing_sl is None or new_trail > pos.trailing_sl:
-                            if new_trail > pos.stop_loss:
-                                pos.trailing_sl = new_trail
-                                await self._update_sl_order(pos, new_trail)
-                                logger.debug(
-                                    f"[TRAIL] SL 上移至 {new_trail:.2f} "
-                                    f"(价格:{current_price:.2f})"
-                                )
-                    else:
-                        new_trail = current_price + trail_dist
-                        if pos.trailing_sl is None or new_trail < pos.trailing_sl:
-                            if new_trail < pos.stop_loss:
-                                pos.trailing_sl = new_trail
-                                await self._update_sl_order(pos, new_trail)
-                                logger.debug(
-                                    f"[TRAIL] SL 下移至 {new_trail:.2f} "
-                                    f"(价格:{current_price:.2f})"
-                                )
+        remaining = round(pos.contracts_total * (1 - self.cfg.tp1_close_pct), 4)
+        pos.contracts_remaining = remaining
+        self.state = PositionState.PARTIAL_EXIT
 
-                    # 检查是否已达 TP2
-                    if pos.direction == "long" and current_price >= pos.tp2:
-                        logger.info(f"[TRAIL] 达到 TP2 目标 {pos.tp2:.2f}，平仓剩余")
-                        await self._close_remaining(pos, current_price, "tp2")
-                        break
-                    elif pos.direction == "short" and current_price <= pos.tp2:
-                        logger.info(f"[TRAIL] 达到 TP2 目标 {pos.tp2:.2f}，平仓剩余")
-                        await self._close_remaining(pos, current_price, "tp2")
-                        break
+        logger.info(
+            f"[EXE] TP1 成交 @ {pos.tp1:.2f} | "
+            f"TP1 PnL:{pos.tp1_pnl:+.4f} USDT | "
+            f"剩余仓位:{remaining} 张"
+        )
+        self.tlog.log_tp1(pos)
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[TRAIL] 异常: {e}", exc_info=True)
-                await asyncio.sleep(5)
+    async def _update_trailing(
+        self, pos: ActivePosition, price: float, atr: float
+    ) -> None:
+        """按 ATR * trailing_atr_mult 动态上移/下移 SL"""
+        trail_dist = atr * self.cfg.trailing_atr_mult if atr > 0 else price * 0.005
 
-        logger.info("[TRAIL] Trailing stop 监控结束")
+        if pos.direction == "long":
+            new_trail = price - trail_dist
+            # 只向有利方向（上）移动，且必须高于原始 SL
+            if (new_trail > pos.stop_loss
+                    and (pos.trailing_sl is None or new_trail > pos.trailing_sl)):
+                pos.trailing_sl = new_trail
+                await self._update_sl_order(pos, new_trail)
+                logger.debug(f"[TRAIL] SL 上移 → {new_trail:.2f} (价格:{price:.2f})")
+        else:
+            new_trail = price + trail_dist
+            # 只向有利方向（下）移动，且必须低于原始 SL
+            if (new_trail < pos.stop_loss
+                    and (pos.trailing_sl is None or new_trail < pos.trailing_sl)):
+                pos.trailing_sl = new_trail
+                await self._update_sl_order(pos, new_trail)
+                logger.debug(f"[TRAIL] SL 下移 → {new_trail:.2f} (价格:{price:.2f})")
 
     # ──────────────────── 下单辅助 ────────────────────
 
@@ -293,10 +289,13 @@ class PO3Executor:
             logger.info(f"[DRY] set_leverage {self.cfg.leverage}x")
             return
         try:
-            await self.exchange.set_leverage(self.cfg.leverage, self.cfg.symbol)
-            logger.info(f"[EXE] 杠杆设置: {self.cfg.leverage}x")
+            await self.exchange.set_leverage(
+                self.cfg.leverage, self.cfg.symbol,
+                {"marginMode": "isolated"}
+            )
+            logger.info(f"[EXE] 杠杆设置: {self.cfg.leverage}x (isolated)")
         except Exception as e:
-            logger.warning(f"[EXE] set_leverage 失败（可能已设置）: {e}")
+            logger.warning(f"[EXE] set_leverage 警告（可能已设置）: {e}")
 
     async def _place_market_order(
         self, side: str, amount: float
@@ -306,7 +305,8 @@ class PO3Executor:
             return {"average": None, "price": None, "id": "dry_entry"}
         try:
             order = await self.exchange.create_order(
-                self.cfg.symbol, "market", side, amount
+                self.cfg.symbol, "market", side, amount,
+                None, {"marginMode": "isolated"},
             )
             logger.info(
                 f"[EXE] 市价单成交 {side} {amount} "
@@ -321,24 +321,30 @@ class PO3Executor:
     async def _place_sl_order(
         self, direction: str, amount: float, sl_price: float
     ) -> Optional[str]:
-        """挂止损单（stop-market）"""
+        """
+        [BUG3] Bitget 专用止损单：
+          - 订单类型: stop_market
+          - 参数: triggerPrice（Bitget 原生字段）+ stopPrice（ccxt 统一字段）
+        """
         side = "sell" if direction == "long" else "buy"
-        close_params = self._CLOSE_PARAMS.get(self.cfg.exchange, {"reduceOnly": True})
-
         if self.dry_run:
-            logger.info(f"[DRY] SL {side} {amount} @ stop {sl_price:.2f}")
+            logger.info(f"[DRY] SL stop_market {side} {amount} @ {sl_price:.2f}")
             return "dry_sl"
         try:
             order = await self.exchange.create_order(
                 self.cfg.symbol, "stop_market", side, amount,
                 None,
-                {**close_params, "stopPrice": sl_price},
+                {
+                    **self._BITGET_STOP_PARAMS,
+                    "stopPrice": sl_price,       # ccxt 统一字段
+                    "triggerPrice": sl_price,    # Bitget 原生字段（备用）
+                },
             )
             oid = order.get("id")
             logger.info(f"[EXE] SL 单挂出 @ {sl_price:.2f} ID:{oid}")
             return oid
         except Exception as e:
-            logger.error(f"[EXE] SL 单挂单失败: {e}")
+            logger.error(f"[EXE] SL 挂单失败: {e}")
             return None
 
     async def _place_tp1_order(
@@ -346,48 +352,45 @@ class PO3Executor:
     ) -> Optional[str]:
         """挂 TP1 限价单"""
         side = "sell" if direction == "long" else "buy"
-        close_params = self._CLOSE_PARAMS.get(self.cfg.exchange, {"reduceOnly": True})
-
         if self.dry_run:
-            logger.info(f"[DRY] TP1 {side} {amount} @ limit {tp1_price:.2f}")
+            logger.info(f"[DRY] TP1 limit {side} {amount} @ {tp1_price:.2f}")
             return "dry_tp1"
         try:
             order = await self.exchange.create_order(
                 self.cfg.symbol, "limit", side, amount, tp1_price,
-                close_params,
+                self._BITGET_CLOSE_PARAMS,
             )
             oid = order.get("id")
             logger.info(f"[EXE] TP1 单挂出 @ {tp1_price:.2f} ID:{oid}")
             return oid
         except Exception as e:
-            logger.error(f"[EXE] TP1 单挂单失败: {e}")
+            logger.error(f"[EXE] TP1 挂单失败: {e}")
             return None
 
     async def _update_sl_order(
         self, pos: ActivePosition, new_sl: float
     ) -> None:
-        """取消旧 SL 单，挂新 SL 单"""
+        """取消旧 SL 单，挂新 SL 单（trailing 更新用）"""
         side = "sell" if pos.direction == "long" else "buy"
-        close_params = self._CLOSE_PARAMS.get(self.cfg.exchange, {"reduceOnly": True})
-
         if self.dry_run:
-            logger.debug(f"[DRY] update SL → {new_sl:.2f}")
             pos.stop_loss = new_sl
             return
-
         # 取消旧单
-        if pos.sl_order_id and pos.sl_order_id != "dry_sl":
+        if pos.sl_order_id and not pos.sl_order_id.startswith("dry_"):
             try:
                 await self.exchange.cancel_order(pos.sl_order_id, self.cfg.symbol)
             except Exception as e:
-                logger.warning(f"[EXE] 取消旧SL单失败: {e}")
-
+                logger.warning(f"[EXE] 取消旧SL单失败（可能已触发）: {e}")
         # 挂新单
         try:
             order = await self.exchange.create_order(
                 self.cfg.symbol, "stop_market", side,
                 pos.contracts_remaining, None,
-                {**close_params, "stopPrice": new_sl},
+                {
+                    **self._BITGET_STOP_PARAMS,
+                    "stopPrice": new_sl,
+                    "triggerPrice": new_sl,
+                },
             )
             pos.sl_order_id = order.get("id")
             pos.stop_loss = new_sl
@@ -399,36 +402,59 @@ class PO3Executor:
     ) -> None:
         """市价平掉剩余仓位"""
         side = "sell" if pos.direction == "long" else "buy"
-        close_params = self._CLOSE_PARAMS.get(self.cfg.exchange, {"reduceOnly": True})
-
         if not self.dry_run and pos.contracts_remaining > 0:
             try:
                 await self.exchange.create_order(
                     self.cfg.symbol, "market", side,
-                    pos.contracts_remaining, None, close_params
+                    pos.contracts_remaining, None,
+                    self._BITGET_CLOSE_PARAMS,
                 )
             except Exception as e:
                 logger.error(f"[EXE] 平仓剩余失败: {e}")
+        await self._on_position_closed(reason, price, pos.contracts_remaining)
 
-        await self._on_position_closed(reason, price)
+    async def _emergency_market_close(
+        self, direction: str, contracts: float
+    ) -> None:
+        """紧急市价平仓（SL 挂单失败时使用）"""
+        side = "sell" if direction == "long" else "buy"
+        if self.dry_run:
+            return
+        try:
+            await self.exchange.create_order(
+                self.cfg.symbol, "market", side, contracts,
+                None, self._BITGET_CLOSE_PARAMS,
+            )
+            logger.info("[EXE] 紧急平仓执行完成")
+        except Exception as e:
+            logger.critical(f"[EXE] 紧急平仓失败！请手动处理持仓: {e}")
 
-    async def _on_position_closed(self, reason: str, close_price: float) -> None:
-        """统一处理持仓关闭后续"""
+    async def _on_position_closed(
+        self, reason: str, close_price: float, contracts_closed: float
+    ) -> None:
+        """
+        [BUG4 修复] PnL 只按实际平仓的 contracts 计算，不重复计 TP1 部分。
+        """
         pos = self.position
         if pos is None:
             return
 
         if pos.direction == "long":
-            pnl = (close_price - pos.entry_price) * pos.contracts_total
+            pnl = (close_price - pos.entry_price) * contracts_closed
         else:
-            pnl = (pos.entry_price - close_price) * pos.contracts_total
+            pnl = (pos.entry_price - close_price) * contracts_closed
+
+        pos.realized_pnl = pnl
+        total_pnl = pos.tp1_pnl + pnl
 
         logger.info(
             f"[EXE] 持仓关闭 reason={reason} "
-            f"close_price={close_price:.2f} PnL≈{pnl:+.4f} USDT"
+            f"close_price={close_price:.2f} | "
+            f"TP1 PnL:{pos.tp1_pnl:+.4f} + "
+            f"本次:{pnl:+.4f} = 总:{total_pnl:+.4f} USDT"
         )
-        self.tlog.log_close(pos, close_price, pnl, reason)
-        self.risk.record_trade_close(pnl)
+        self.tlog.log_close(pos, close_price, total_pnl, reason)
+        self.risk.record_trade_close(total_pnl)
 
         self.position = None
         self.state = PositionState.IDLE
@@ -445,56 +471,22 @@ class PO3Executor:
             logger.debug(f"[EXE] fetch_order {order_id}: {e}")
             return False
 
-    async def _fetch_ticker(self) -> Optional[dict]:
-        try:
-            return await self.exchange.fetch_ticker(self.cfg.symbol)
-        except Exception as e:
-            logger.warning(f"[EXE] fetch_ticker 失败: {e}")
-            return None
-
-    async def _fetch_ohlcv(self, timeframe: str, limit: int):
-        try:
-            raw = await self.exchange.fetch_ohlcv(
-                self.cfg.symbol, timeframe, limit=limit
-            )
-            from po3.detector import PO3Detector
-            return PO3Detector.candles_to_df(raw)
-        except Exception as e:
-            logger.warning(f"[EXE] fetch_ohlcv({timeframe}) 失败: {e}")
-            return None
-
-    # ──────────────────── 紧急平仓 ────────────────────
+    # ──────────────────── 紧急退出 ────────────────────
 
     async def emergency_close(self) -> None:
         """程序退出时强制平仓"""
         if self.position is None or self.state == PositionState.IDLE:
             return
-        logger.warning("[EXE] 紧急平仓中...")
-        if self._trailing_task and not self._trailing_task.done():
-            self._trailing_task.cancel()
-
+        logger.warning("[EXE] 程序退出，紧急平仓...")
         pos = self.position
-        side = "sell" if pos.direction == "long" else "buy"
-        close_params = self._CLOSE_PARAMS.get(self.cfg.exchange, {"reduceOnly": True})
-
-        if not self.dry_run:
-            try:
-                # 先取消所有挂单
-                for oid in [pos.sl_order_id, pos.tp1_order_id]:
-                    if oid and not oid.startswith("dry_"):
-                        try:
-                            await self.exchange.cancel_order(oid, self.cfg.symbol)
-                        except Exception:
-                            pass
-                # 市价平仓
-                await self.exchange.create_order(
-                    self.cfg.symbol, "market", side,
-                    pos.contracts_remaining, None, close_params
-                )
-                logger.info("[EXE] 紧急平仓完成")
-            except Exception as e:
-                logger.error(f"[EXE] 紧急平仓失败: {e}")
-
+        # 取消所有挂单
+        for oid in [pos.sl_order_id, pos.tp1_order_id]:
+            if oid and not oid.startswith("dry_") and not self.dry_run:
+                try:
+                    await self.exchange.cancel_order(oid, self.cfg.symbol)
+                except Exception:
+                    pass
+        await self._emergency_market_close(pos.direction, pos.contracts_remaining)
         self.position = None
         self.state = PositionState.IDLE
 

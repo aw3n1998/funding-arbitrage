@@ -1,79 +1,77 @@
 """
-PO3/AMD 剥头皮策略机器人 — 主入口
+PO3/AMD 剥头皮策略机器人 — 主入口（Bitget 专版）
 
-交易逻辑：
-    15m 图 → 识别 Accumulation / Manipulation / Bias
-    1m  图 → 等待入场信号（吞没/Pinbar/FVG回测）
-    执行   → 市价入场 + SL + TP1(50%) + Trailing TP2
+数据驱动方式：
+    WebSocket 流（ccxt.pro）→ DataFeed 维护实时 K 线
+    → 15m K 线收盘事件触发 Accumulation/Manipulation 检测
+    → 发现 Manipulation 后监听 1m K 线收盘事件触发入场信号检测
+    → 入场后每 5s tick 驱动 trailing stop 管理
 
 运行方式:
-    python main.py                  # 实盘/测试网（按 .env 配置）
-    python main.py --dry-run        # 不真实下单，只跑逻辑+日志
-    python main.py --scan           # 只打印一次当前 PO3 阶段，不交易
+    python main.py                  # 实盘 / 测试网（按 .env 配置）
+    python main.py --dry-run        # 不真实下单，只跑逻辑和日志
+    python main.py --scan           # 一次性打印当前 PO3 阶段，不运行机器人
 """
 import argparse
 import asyncio
-import signal
+import signal as os_signal
 import sys
 from datetime import datetime
 
-import ccxt.async_support as ccxt
+import ccxt.pro as ccxtpro
 from loguru import logger
 
 from config import load_config, PO3Config
+from po3.data_feed import DataFeed
 from po3.detector import PO3Detector
-from po3.risk_manager import RiskManager
 from po3.executor import PO3Executor, PositionState
 from po3.logger import TradeLogger
+from po3.risk_manager import RiskManager
 from utils.logger import setup_logger
 
 
-# ─────────────────────────────── 交易所初始化 ────────────────────────────────
+# ─────────────────────────── 交易所构建（仅 Bitget）────────────────────────────
 
 
-def build_exchange(cfg: PO3Config) -> ccxt.Exchange:
-    """根据配置构建 CCXT 交易所实例"""
-    exchange_classes = {
-        "binance": ccxt.binance,
-        "bybit": ccxt.bybit,
-    }
-    cls = exchange_classes.get(cfg.exchange.lower())
-    if cls is None:
-        raise ValueError(f"不支持的交易所: {cfg.exchange}（支持: binance, bybit）")
-
+def build_exchange(cfg: PO3Config) -> ccxtpro.Exchange:
+    """构建 Bitget ccxt.pro 实例"""
     params = {
         "apiKey": cfg.api_key,
         "secret": cfg.api_secret,
+        "password": cfg.api_passphrase,   # Bitget 必填 passphrase
         "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
+        "options": {
+            "defaultType": "swap",
+            "defaultSubType": "linear",
+        },
     }
     if cfg.testnet:
         params["sandbox"] = True
 
-    return cls(params)
+    exchange = ccxtpro.bitget(params)
+    return exchange
 
 
-# ─────────────────────────────── 机器人主体 ──────────────────────────────────
+# ──────────────────────────── 机器人主体 ─────────────────────────────────────
 
 
 class PO3Bot:
     """
-    PO3/AMD 剥头皮机器人
+    PO3/AMD 剥头皮机器人（事件驱动架构）
 
-    主循环状态机：
-        SCANNING_15M  — 每 30s 拉 15m 图，检测 Accumulation/Manipulation
-        WATCHING_1M   — 发现 Manipulation 后，每 5s 拉 1m 图等待入场信号
-        IN_POSITION   — 持仓中，让 executor 的 trailing_task 管理
+    任务拓扑：
+        DataFeed.start()       ← 持续维护 WS 流
+        _loop_15m()            ← 等待 15m K线收盘事件 → 检测 Acc/Manip
+        _loop_1m()             ← 等待 1m K线收盘事件 → 检测入场信号
+        _loop_trailing()       ← 每 5s tick → 管理 trailing stop
+        _loop_status()         ← 每 60s 打印持仓状态
     """
-
-    _MODE_SCAN = "scan_15m"
-    _MODE_WATCH = "watch_1m"
-    _MODE_HOLD = "in_position"
 
     def __init__(self, cfg: PO3Config, dry_run: bool = False):
         self.cfg = cfg
         self.dry_run = dry_run
-        self.exchange: ccxt.Exchange = build_exchange(cfg)
+        self.exchange: ccxtpro.Exchange = build_exchange(cfg)
+        self.feed = DataFeed(self.exchange, cfg.symbol)
         self.detector = PO3Detector(cfg)
         self.risk = RiskManager(cfg)
         self.tlog = TradeLogger()
@@ -81,105 +79,114 @@ class PO3Bot:
             self.exchange, cfg, self.risk, self.tlog, dry_run=dry_run
         )
         self._running = False
-        self._mode = self._MODE_SCAN
-        self._current_manipulation = None  # ManipulationEvent | None
+        # [BUG9 修复] Manipulation 状态：None = 扫描中，有值 = 候信中
+        self._current_manip = None   # ManipulationEvent | None
 
-    # ──────────────────── 启动/停止 ────────────────────
+    # ──────────────────── 启动 / 停止 ────────────────────
 
     async def start(self) -> None:
         logger.info("=" * 65)
-        logger.info("  PO3/AMD 剥头皮机器人 启动")
-        logger.info(f"  交易所   : {self.cfg.exchange.upper()} "
-                    f"({'测试网' if self.cfg.testnet else '实盘'})")
+        logger.info("  PO3/AMD 剥头皮机器人 (Bitget WebSocket)")
+        logger.info(f"  网络     : {'测试网' if self.cfg.testnet else '实盘'}")
         logger.info(f"  标的     : {self.cfg.symbol}")
-        logger.info(f"  杠杆     : {self.cfg.leverage}x")
+        logger.info(f"  杠杆     : {self.cfg.leverage}x (isolated)")
         logger.info(f"  每笔风险 : {self.cfg.risk_per_trade*100:.1f}%")
-        logger.info(f"  每日上限 : {self.cfg.max_daily_trades} 次 / "
-                    f"最大亏损 {self.cfg.max_daily_loss*100:.1f}%")
-        logger.info(f"  RR目标   : TP1={self.cfg.tp1_rr} TP2={self.cfg.tp2_rr}")
+        logger.info(f"  每日上限 : {self.cfg.max_daily_trades}次 / "
+                    f"最大亏损{self.cfg.max_daily_loss*100:.1f}%")
+        logger.info(f"  RR      : TP1={self.cfg.tp1_rr} TP2={self.cfg.tp2_rr}")
         logger.info(f"  模式     : {'DRY RUN' if self.dry_run else '实盘'}")
         logger.info("=" * 65)
 
         # 加载市场
         try:
             await self.exchange.load_markets()
-            logger.info(f"市场加载完成，共 {len(self.exchange.markets)} 个")
+            logger.info(f"市场加载完成")
         except Exception as e:
             logger.error(f"市场加载失败: {e}")
             return
 
-        # 获取初始权益，设置日内起始值
+        # 获取初始权益（[BUG10] 失败不使用默认值，只记录 warning）
         equity = await self._fetch_equity()
-        self.risk.set_daily_start_equity(equity)
-        logger.info(f"账户权益: {equity:.2f} USDT")
+        if equity is not None:
+            self.risk.set_daily_start_equity(equity)
+            logger.info(f"账户权益: {equity:.2f} USDT")
+        else:
+            logger.warning("初始权益获取失败，每笔交易前会重新检查")
 
         self._running = True
-        await self._main_loop()
+
+        await asyncio.gather(
+            self.feed.start(),          # WS 数据流（阻塞）
+            self._loop_15m(),
+            self._loop_1m(),
+            self._loop_trailing(),
+            self._loop_status(),
+            return_exceptions=True,
+        )
 
     async def shutdown(self) -> None:
         logger.info("正在安全退出...")
         self._running = False
+        await self.feed.stop()
         await self.executor.emergency_close()
         try:
             await self.exchange.close()
         except Exception:
             pass
-        logger.info("机器人已退出")
+        logger.info("机器人已安全退出")
 
-    # ──────────────────── 主循环 ────────────────────
+    # ──────────────────── 15m 事件循环 ────────────────────
 
-    async def _main_loop(self) -> None:
+    async def _loop_15m(self) -> None:
         """
-        双模式主循环：
-        - SCAN 模式：宽间隔(30s)扫描 15m 图寻找 PO3 信号
-        - WATCH 模式：窄间隔(5s)盯 1m 图等待入场
+        等待 15m K 线收盘事件。
+        每次收盘运行 Accumulation → Manipulation 检测。
         """
-        consecutive_errors = 0
+        # 等待 DataFeed 初始化完成
+        while self._running and not self.feed.is_ready:
+            await asyncio.sleep(1)
+        logger.info("[15M] 数据就绪，开始监听 15m K线收盘")
 
         while self._running:
             try:
-                if self.executor.is_in_position:
-                    # 持仓中：主循环仅做状态打印，实际由 trailing_task 管理
-                    await self._print_position_status()
-                    await asyncio.sleep(30)
-                    consecutive_errors = 0
+                # 等待收盘事件（带超时，防止 WS 断开时永久阻塞）
+                try:
+                    await asyncio.wait_for(
+                        self._wait_event(self.feed.candle_closed_15m),
+                        timeout=1800,  # 最多等 30 分钟（一根 15m K线的时长）
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[15M] 等待 K线收盘超时，检查 WebSocket 连接")
                     continue
 
-                if self._mode == self._MODE_SCAN:
-                    await self._scan_15m()
-                    await asyncio.sleep(self.cfg.poll_interval_15m)
+                if not self._running:
+                    break
 
-                elif self._mode == self._MODE_WATCH:
-                    await self._watch_1m()
-                    await asyncio.sleep(self.cfg.poll_interval_1m)
+                # 持仓中不重新扫描（专注管理当前持仓）
+                if self.executor.is_in_position:
+                    continue
 
-                consecutive_errors = 0
+                await self._on_15m_close()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"主循环异常 (连续:{consecutive_errors}): {e}",
-                             exc_info=True)
-                # 指数退避，最多等 120s
-                backoff = min(2 ** consecutive_errors, 120)
-                logger.info(f"等待 {backoff}s 后重试...")
-                await asyncio.sleep(backoff)
+                logger.error(f"[15M] 循环异常: {e}", exc_info=True)
+                await asyncio.sleep(5)
 
-    # ──────────────────── 15m 扫描 ────────────────────
-
-    async def _scan_15m(self) -> None:
-        """拉取 15m K线，识别 Accumulation → Manipulation"""
-        df_15m = await self._fetch_ohlcv("15m", 80)
-        if df_15m is None:
+    async def _on_15m_close(self) -> None:
+        """15m 收盘时的检测逻辑"""
+        df_15m = self.feed.get_df_15m()
+        if len(df_15m) < 20:
             return
 
-        atr = PO3Detector.get_current_atr(df_15m)
-
-        # 1. 检测累积区间
+        # ── 检测 Accumulation ──
         acc = self.detector.detect_accumulation(df_15m)
         if acc is None:
-            logger.debug("[SCAN] 未发现累积区间")
+            logger.debug("[15M] 无累积区间")
+            # 没有累积区间时清除上次 Manipulation（避免持有过期状态）
+            if self._current_manip is not None:
+                self._clear_manipulation("累积区间消失，放弃旧 Manipulation")
             return
 
         self.tlog.log_po3_phase(
@@ -188,65 +195,94 @@ class PO3Bot:
             self.cfg.symbol,
         )
 
-        # 2. 检测 Manipulation
+        # ── 检测 Manipulation ──
         manip = self.detector.detect_manipulation(df_15m, acc)
         if manip is None:
-            logger.debug(f"[SCAN] 有累积区间，等待 Manipulation... {acc}")
+            logger.debug(f"[15M] 等待 Manipulation... {acc}")
             return
 
-        self.tlog.log_po3_phase(
-            "manipulation",
-            str(manip),
-            self.cfg.symbol,
-        )
-        logger.info(f"[SCAN] Manipulation 识别: {manip}")
+        # [BUG9 修复] 去重检查已在 detector._is_new_manipulation 中完成
+        # 这里额外检查：如果已在候信模式，且是同一个 Manipulation，忽略
+        if self._current_manip is not None:
+            if manip.fingerprint() == self._current_manip.fingerprint():
+                logger.debug("[15M] 同一 Manipulation，保持候信模式")
+                return
 
-        # 3. 切换到 1m 候信模式
-        self._current_manipulation = manip
-        self._mode = self._MODE_WATCH
-        logger.info("[SCAN] → 切换 1m 候信模式")
+        self._current_manip = manip
+        self.detector.reset_entry_dedup()   # 新 Manipulation 重置入场去重
+        self.tlog.log_po3_phase("manipulation", str(manip), self.cfg.symbol)
+        logger.info(f"[15M] Manipulation 识别: {manip} → 进入 1m 候信模式")
 
-    # ──────────────────── 1m 候信 ────────────────────
+    # ──────────────────── 1m 事件循环 ────────────────────
 
-    async def _watch_1m(self) -> None:
+    async def _loop_1m(self) -> None:
         """
-        盯 1m 图等待入场信号。
-        Manipulation 超过 N 根 1m 蜡烛未确认则放弃，回到扫描模式。
+        等待 1m K 线收盘事件。
+        仅在有 Manipulation 信号时检测入场。
         """
-        manip = self._current_manipulation
-        if manip is None:
-            self._mode = self._MODE_SCAN
-            return
+        while self._running and not self.feed.is_ready:
+            await asyncio.sleep(1)
+        logger.info("[1M] 数据就绪，开始监听 1m K线收盘")
 
-        # Manipulation 有效窗口：超过 30 分钟未入场则放弃
+        while self._running:
+            try:
+                try:
+                    await asyncio.wait_for(
+                        self._wait_event(self.feed.candle_closed_1m),
+                        timeout=120,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if not self._running:
+                    break
+
+                # 没有 Manipulation 信号 或 已在持仓中 → 跳过
+                if self._current_manip is None or self.executor.is_in_position:
+                    continue
+
+                await self._on_1m_close()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[1M] 循环异常: {e}", exc_info=True)
+                await asyncio.sleep(2)
+
+    async def _on_1m_close(self) -> None:
+        """1m 收盘时的入场检测逻辑"""
+        manip = self._current_manip
+
+        # Manipulation 有效窗口：超过 manip_max_age_bars × 15min 放弃
         age_secs = (datetime.now() - manip.timestamp).total_seconds()
-        if age_secs > 30 * 60:
-            logger.info("[WATCH] Manipulation 信号超时 30min，重新扫描")
-            self._current_manipulation = None
-            self._mode = self._MODE_SCAN
+        max_age_secs = self.cfg.manip_max_age_bars * 15 * 60
+        if age_secs > max_age_secs:
+            self._clear_manipulation(
+                f"Manipulation 超时 {age_secs/60:.0f}min > "
+                f"{max_age_secs/60:.0f}min，放弃"
+            )
             return
 
-        # 风控检查
+        # [BUG10] 风控检查：权益获取失败则拒绝
         equity = await self._fetch_equity()
         can, reason = self.risk.can_trade(equity)
         if not can:
             self.tlog.log_signal_rejected(reason, self.cfg.symbol)
-            self._current_manipulation = None
-            self._mode = self._MODE_SCAN
+            self._clear_manipulation(f"风控拒绝: {reason}")
             return
 
-        # 拉取 1m 图
-        df_1m = await self._fetch_ohlcv("1m", 30)
-        if df_1m is None:
+        # 拉取已收盘 1m K 线
+        df_1m = self.feed.get_df_1m()
+        if len(df_1m) < 5:
             return
 
         # 检测入场信号
         signal = self.detector.detect_entry_signal(df_1m, manip)
         if signal is None:
-            logger.debug("[WATCH] 等待 1m 入场信号...")
+            logger.debug("[1M] 等待入场信号...")
             return
 
-        logger.info(f"[WATCH] 入场信号确认: {signal}")
+        logger.info(f"[1M] 入场信号确认: {signal}")
         self.tlog.log_po3_phase("distribution", str(signal), self.cfg.symbol)
 
         # 执行入场
@@ -254,126 +290,197 @@ class PO3Bot:
         success = await self.executor.enter(signal, equity, atr)
 
         if success:
-            logger.info(f"[WATCH] 入场成功，切换持仓监控模式")
+            logger.info("[1M] 入场成功，等待持仓结果")
         else:
-            logger.warning("[WATCH] 入场失败，回到扫描模式")
+            logger.warning("[1M] 入场失败")
 
-        self._current_manipulation = None
-        self._mode = self._MODE_SCAN
+        # 入场后（无论成功）清除当前 Manipulation，等待下一次机会
+        self._clear_manipulation("入场尝试后清除")
+
+    def _clear_manipulation(self, reason: str) -> None:
+        """清除当前 Manipulation 状态，回到 15m 扫描模式"""
+        if self._current_manip is not None:
+            logger.info(f"[BOT] 清除 Manipulation: {reason}")
+        self._current_manip = None
+        self.detector.reset_entry_dedup()
+        self.detector.reset_manip_fingerprint()
+
+    # ──────────────────── Trailing Stop 循环 ────────────────────
+
+    async def _loop_trailing(self) -> None:
+        """
+        每 poll_interval_1m 秒调用 executor.tick()。
+        使用 DataFeed.last_price（WS ticker 实时价格），无需额外 API 请求。
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self.cfg.poll_interval_1m)
+
+                if not self.executor.is_in_position:
+                    continue
+                if self.feed.last_price <= 0:
+                    logger.debug("[TRAIL] 等待实时价格...")
+                    continue
+
+                # 用已收盘 1m K 线计算 ATR
+                df_1m = self.feed.get_df_1m()
+                atr = PO3Detector.get_current_atr(df_1m) if len(df_1m) >= 15 else 0.0
+
+                await self.executor.tick(self.feed.last_price, atr)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[TRAIL] 循环异常: {e}", exc_info=True)
+                await asyncio.sleep(5)
+
+    # ──────────────────── 状态打印循环 ────────────────────
+
+    async def _loop_status(self) -> None:
+        """每 60s 打印一次机器人状态"""
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+                await self._print_status()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _print_status(self) -> None:
+        price = self.feed.last_price
+        equity = await self._fetch_equity()
+        equity_str = f"{equity:.2f}" if equity else "N/A"
+        pos = self.executor.position
+
+        if pos:
+            if price > 0:
+                if pos.direction == "long":
+                    unreal = (price - pos.entry_price) * pos.contracts_total
+                else:
+                    unreal = (pos.entry_price - price) * pos.contracts_total
+            else:
+                unreal = 0.0
+            holding_min = (datetime.now() - pos.opened_at).total_seconds() / 60
+            logger.info(
+                f"[STATUS] {pos.direction.upper()} {pos.contracts_total:.4f}张 @ "
+                f"{pos.entry_price:.2f} | 现价:{price:.2f} | "
+                f"未实现:{unreal:+.4f} USDT | SL:{pos.stop_loss:.2f} | "
+                f"持仓:{holding_min:.1f}min | 状态:{self.executor.state.value}"
+            )
+        else:
+            manip_str = f"候信({self._current_manip.bias})" if self._current_manip else "扫描中"
+            logger.info(
+                f"[STATUS] 空仓 | 权益:{equity_str} USDT | "
+                f"今日:{self.risk.daily_trades_count}笔 | 模式:{manip_str} | "
+                f"WS价格:{price:.2f}"
+            )
 
     # ──────────────────── 工具 ────────────────────
 
-    async def _fetch_equity(self) -> float:
-        """获取账户 USDT 权益"""
+    @staticmethod
+    async def _wait_event(event: asyncio.Event) -> None:
+        """等待事件并自动清除（避免调用方忘记 clear）"""
+        await event.wait()
+        event.clear()
+
+    async def _fetch_equity(self):
+        """
+        [BUG10 修复] 获取账户 USDT 权益。
+        失败返回 None（不使用任何默认值）。
+        """
         try:
             balance = await self.exchange.fetch_balance({"type": "swap"})
-            usdt = balance.get("USDT", {})
-            equity = float(usdt.get("total") or usdt.get("equity") or 0)
-            if equity <= 0:
-                # Bybit 字段不同
-                equity = float(balance.get("total", {}).get("USDT", 0))
-            return equity if equity > 0 else 1000.0   # 兜底（dry run）
+            usdt = balance.get("USDT") or balance.get("usdt") or {}
+            if isinstance(usdt, dict):
+                equity = float(usdt.get("total") or usdt.get("equity") or 0)
+            else:
+                equity = float(usdt)
+            return equity if equity > 0 else None
         except Exception as e:
-            logger.warning(f"获取权益失败: {e}，使用默认 1000 USDT")
-            return 1000.0
-
-    async def _fetch_ohlcv(self, timeframe: str, limit: int):
-        """获取 K 线并转换为 DataFrame"""
-        try:
-            raw = await self.exchange.fetch_ohlcv(
-                self.cfg.symbol, timeframe, limit=limit
-            )
-            return PO3Detector.candles_to_df(raw)
-        except Exception as e:
-            logger.warning(f"fetch_ohlcv({timeframe}) 失败: {e}")
+            logger.warning(f"[BOT] 获取权益失败: {e}")
             return None
 
-    async def _print_position_status(self) -> None:
-        """打印当前持仓状态"""
-        pos = self.executor.position
-        if pos is None:
-            return
-        try:
-            ticker = await self.exchange.fetch_ticker(self.cfg.symbol)
-            price = float(ticker["last"])
-            if pos.direction == "long":
-                unreal_pnl = (price - pos.entry_price) * pos.contracts_total
-            else:
-                unreal_pnl = (pos.entry_price - price) * pos.contracts_total
-            holding_min = (datetime.now() - pos.opened_at).total_seconds() / 60
-            logger.info(
-                f"[POS] {pos.direction.upper()} {pos.contracts_total:.4f} @ "
-                f"{pos.entry_price:.2f} | 现价:{price:.2f} | "
-                f"未实现PnL:{unreal_pnl:+.4f} USDT | "
-                f"SL:{pos.stop_loss:.2f} | "
-                f"持仓:{holding_min:.1f}min | "
-                f"状态:{self.executor.state.value}"
-            )
-        except Exception:
-            pass
 
-
-# ─────────────────────────────── Scan 模式 ──────────────────────────────────
+# ──────────────────────────── Scan 模式 ─────────────────────────────────────
 
 
 async def run_scan(cfg: PO3Config) -> None:
-    """一次性扫描当前 PO3 阶段，不交易"""
-    exchange = build_exchange(cfg)
+    """一次性打印当前 BTC/USDT PO3 阶段，不运行机器人"""
+    import ccxt.async_support as ccxt_async
+
+    # Scan 模式用 REST（不需要 WS）
+    rest_cls = getattr(ccxt_async, "bitget")
+    exchange = rest_cls({
+        "apiKey": cfg.api_key,
+        "secret": cfg.api_secret,
+        "password": cfg.api_passphrase,
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+        **({"sandbox": True} if cfg.testnet else {}),
+    })
     detector = PO3Detector(cfg)
 
     try:
         await exchange.load_markets()
-        raw_15m = await exchange.fetch_ohlcv(cfg.symbol, "15m", limit=80)
+
+        raw_15m = await exchange.fetch_ohlcv(cfg.symbol, "15m", limit=100)
         df_15m = PO3Detector.candles_to_df(raw_15m)
-        atr = PO3Detector.get_current_atr(df_15m)
+        df_15m_closed = df_15m.iloc[:-1]  # 排除未收盘蜡烛
+        atr = PO3Detector.get_current_atr(df_15m_closed)
 
-        print(f"\n{'='*60}")
-        print(f"  PO3 阶段扫描  |  {cfg.symbol}  |  {datetime.now().strftime('%H:%M:%S')}")
-        print(f"{'='*60}")
-        print(f"  当前 ATR(14): {atr:.2f}")
+        print(f"\n{'='*62}")
+        print(f"  PO3 阶段扫描  |  {cfg.symbol}  |  {datetime.now():%H:%M:%S}")
+        print(f"{'='*62}")
+        print(f"  ATR(14): {atr:.2f}  |  最新收盘: {float(df_15m_closed['close'].iloc[-1]):.2f}")
 
-        acc = detector.detect_accumulation(df_15m)
+        acc = detector.detect_accumulation(df_15m_closed)
         if acc is None:
-            print("  阶段: 无累积区间（价格处于趋势或高波动状态）")
+            print("  阶段: 无累积区间（趋势或高波动状态）")
         else:
             print(f"  阶段: ACCUMULATION")
             print(f"  区间: H={acc.high:.2f}  L={acc.low:.2f}  高度={acc.height:.2f}")
 
-            manip = detector.detect_manipulation(df_15m, acc)
+            manip = detector.detect_manipulation(df_15m_closed, acc)
             if manip is None:
                 print("  等待 Manipulation 假突破...")
             else:
-                print(f"  阶段: MANIPULATION → {manip.bias.upper()}")
-                print(f"  假突破方向: {manip.direction}  极值: {manip.extreme:.2f}")
-                if manip.has_fvg:
-                    print(f"  FVG: {manip.fvg_low:.2f} ~ {manip.fvg_high:.2f}")
+                print(f"  阶段: MANIPULATION  bias={manip.bias.upper()}")
+                print(f"  假突破: {manip.direction}  极值={manip.extreme:.2f}")
 
-                raw_1m = await exchange.fetch_ohlcv(cfg.symbol, "1m", limit=30)
+                raw_1m = await exchange.fetch_ohlcv(cfg.symbol, "1m", limit=50)
                 df_1m = PO3Detector.candles_to_df(raw_1m)
-                signal = detector.detect_entry_signal(df_1m, manip)
+                df_1m_closed = df_1m.iloc[:-1]
+
+                fvg = detector.find_fvg_1m(
+                    df_1m_closed,
+                    "bullish" if manip.bias == "bullish" else "bearish"
+                )
+                if fvg:
+                    print(f"  FVG(1m): {fvg[0]:.2f} ~ {fvg[1]:.2f}")
+                else:
+                    print("  FVG(1m): 未发现")
+
+                signal = detector.detect_entry_signal(df_1m_closed, manip)
                 if signal:
-                    print(f"  阶段: DISTRIBUTION → {signal}")
+                    print(f"  阶段: DISTRIBUTION  →  {signal}")
                 else:
                     print("  等待 1m 入场信号...")
 
-        print(f"{'='*60}\n")
+        print(f"{'='*62}\n")
     finally:
         await exchange.close()
 
 
-# ─────────────────────────────── 入口 ────────────────────────────────────────
+# ──────────────────────────── 入口 ───────────────────────────────────────────
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PO3/AMD 剥头皮机器人")
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="不真实下单，仅跑策略逻辑和日志",
-    )
-    parser.add_argument(
-        "--scan", action="store_true",
-        help="一次性打印当前 PO3 阶段，不运行机器人",
-    )
+    parser = argparse.ArgumentParser(description="PO3/AMD 剥头皮机器人 (Bitget)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="不真实下单，只跑策略逻辑和日志")
+    parser.add_argument("--scan",    action="store_true",
+                        help="一次性打印当前 PO3 阶段，不运行机器人")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -383,18 +490,18 @@ def main():
         asyncio.run(run_scan(cfg))
         return
 
-    dry_run = args.dry_run
-    bot = PO3Bot(cfg, dry_run=dry_run)
+    bot = PO3Bot(cfg, dry_run=args.dry_run)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     def _handle_signal():
         logger.info("收到退出信号...")
+        loop.create_task(bot.shutdown())
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (os_signal.SIGINT, os_signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
     try:
@@ -402,8 +509,9 @@ def main():
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        loop.run_until_complete(bot.shutdown())
-        loop.close()
+        if not loop.is_closed():
+            loop.run_until_complete(bot.shutdown())
+            loop.close()
 
 
 if __name__ == "__main__":
