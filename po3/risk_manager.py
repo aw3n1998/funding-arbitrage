@@ -4,10 +4,12 @@
 修复记录：
   - [BUG5]  calculate_position_size 增加杠杆上限约束
   - [BUG10] 权益获取失败时不再使用默认值，返回 None 拒绝开仓
+  - [H3]    record_trade_open 存储 TradeRecord；record_trade_close 接收 trade_id
+            并更新对应记录，支持历史查询与统计
 """
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -27,7 +29,7 @@ class TradeRecord:
     opened_at: datetime = field(default_factory=datetime.now)
     closed_at: Optional[datetime] = None
     pnl: float = 0.0
-    status: str = "open"    # "open" | "tp1" | "closed" | "sl"
+    status: str = "open"    # "open" | "closed" | "sl"
 
 
 class RiskManager:
@@ -39,6 +41,10 @@ class RiskManager:
     2. 计算本次仓位大小（动态根据当前权益）
        - [BUG5] 强制不超过 leverage × equity 的名义价值上限
     3. 计算 TP1/TP2/SL 价位
+
+    [H3] 记录所有交易：
+    - _open_records : {trade_id: TradeRecord}  持仓中的记录
+    - _closed_records: [TradeRecord]           历史已平仓记录
     """
 
     def __init__(self, config):
@@ -47,6 +53,10 @@ class RiskManager:
         self._daily_trades: int = 0
         self._daily_start_equity: float = 0.0
         self._trade_counter: int = 0
+
+        # [H3] 交易记录存储
+        self._open_records: Dict[str, TradeRecord] = {}
+        self._closed_records: List[TradeRecord] = []
 
     # ──────────────── 每日重置 ────────────────
 
@@ -75,7 +85,6 @@ class RiskManager:
         [BUG10 修复] current_equity 为 None 时直接拒绝（不使用默认值）。
         返回 (是否可以交易, 原因说明)
         """
-        # 权益为 None = API 获取失败，拒绝开仓
         if current_equity is None:
             return False, "账户权益获取失败，拒绝开仓"
 
@@ -84,7 +93,6 @@ class RiskManager:
         if self._daily_start_equity <= 0:
             self._daily_start_equity = current_equity
 
-        # 检查交易次数
         if self._daily_trades >= self.cfg.max_daily_trades:
             msg = (
                 f"已达每日交易上限 {self.cfg.max_daily_trades} 次 "
@@ -93,7 +101,6 @@ class RiskManager:
             logger.warning(f"[RISK] {msg}")
             return False, msg
 
-        # 检查每日亏损
         daily_loss_pct = self.daily_loss_pct(current_equity)
         if daily_loss_pct >= self.cfg.max_daily_loss:
             msg = (
@@ -196,15 +203,31 @@ class RiskManager:
     # ──────────────── 记账 ────────────────
 
     def record_trade_open(self, record: TradeRecord) -> None:
+        """[H3] 存储交易记录，不再丢弃"""
         self._daily_trades += 1
         self._trade_counter += 1
+        self._open_records[record.trade_id] = record
         logger.info(
-            f"[RISK] 开仓记录 今日第{self._daily_trades}笔 | "
+            f"[RISK] 开仓记录 today#{self._daily_trades} trade_id={record.trade_id} | "
             f"剩余次数: {self.cfg.max_daily_trades - self._daily_trades}"
         )
 
-    def record_trade_close(self, pnl: float) -> None:
-        logger.info(f"[RISK] 平仓记录 PnL: {pnl:+.4f} USDT")
+    def record_trade_close(self, trade_id: str, pnl: float) -> None:
+        """
+        [H3] 关联并更新对应的 TradeRecord。
+        trade_id 由 executor._on_position_closed 传入。
+        """
+        record = self._open_records.pop(trade_id, None)
+        if record is not None:
+            record.pnl = pnl
+            record.status = "sl" if pnl < 0 else "closed"
+            record.closed_at = datetime.now()
+            self._closed_records.append(record)
+        logger.info(
+            f"[RISK] 平仓记录 trade_id={trade_id} PnL:{pnl:+.4f} USDT"
+        )
+
+    # ──────────────── 查询 ────────────────
 
     @property
     def daily_trades_count(self) -> int:
@@ -218,3 +241,27 @@ class RiskManager:
         if self._daily_start_equity <= 0:
             return 0.0
         return (self._daily_start_equity - current_equity) / self._daily_start_equity
+
+    def daily_stats_snapshot(self) -> dict:
+        """
+        [H4] 返回当前交易日统计快照。
+        在日切前由主循环调用，记录昨日汇总。
+        """
+        closed_today = [r for r in self._closed_records if r.closed_at and r.closed_at.date() == self._today]
+        wins = sum(1 for r in closed_today if r.pnl > 0)
+        total_pnl = sum(r.pnl for r in closed_today)
+        return {
+            "date": self._today.isoformat(),
+            "trades": self._daily_trades,
+            "wins": wins,
+            "total_pnl": total_pnl,
+            "start_equity": self._daily_start_equity,
+        }
+
+    def get_closed_records(self) -> List[TradeRecord]:
+        """返回所有历史平仓记录（副本）"""
+        return list(self._closed_records)
+
+    def get_open_records(self) -> List[TradeRecord]:
+        """返回当前持仓中的记录（副本）"""
+        return list(self._open_records.values())

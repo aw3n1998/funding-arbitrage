@@ -112,6 +112,9 @@ class PO3Detector:
         # [BUG14] 信号去重状态
         self._last_entry_candle_ts: Optional[datetime] = None
         self._last_manip_fingerprint: Optional[tuple] = None
+        # [M1] FVG 缓存：fingerprint → (fvg_low, fvg_high)
+        # FVG 是静态价格结构，找到后同一个 Manipulation 内不重复扫描
+        self._fvg_cache: dict = {}
 
     # ──────────────────── 1. Accumulation ─────────────────────
 
@@ -304,8 +307,15 @@ class PO3Detector:
         if last_ts_dt == self._last_entry_candle_ts:
             return None
 
-        # [BUG7] 在 1m 数据上寻找 FVG
-        fvg = self.find_fvg_1m(df_1m, direction)
+        # [M1] FVG 缓存：同一个 Manipulation 内只扫描一次
+        # FVG 找到后直接复用；未找到时下一根 1m K 线继续尝试（不缓存 None）
+        fp = manip.fingerprint()
+        if fp in self._fvg_cache:
+            fvg = self._fvg_cache[fp]
+        else:
+            fvg = self.find_fvg_1m(df_1m, manip.bias)
+            if fvg is not None:
+                self._fvg_cache[fp] = fvg   # 只缓存成功结果
         if fvg:
             # 将 FVG 信息注入 manipulation（不修改原对象，创建副本）
             manip_with_fvg = ManipulationEvent(
@@ -342,8 +352,9 @@ class PO3Detector:
         return None
 
     def reset_entry_dedup(self) -> None:
-        """换新 Manipulation 时重置入场去重状态"""
+        """换新 Manipulation 时重置入场去重状态及 FVG 缓存"""
         self._last_entry_candle_ts = None
+        self._fvg_cache.clear()   # [M1] 新 Manipulation 时清除旧 FVG 缓存
 
     # ──────────────────── 信号检测子函数 ─────────────────────────
 

@@ -70,21 +70,28 @@ class TradeLogger:
 
     def log_tp1(self, position) -> None:
         """记录 TP1 成交事件"""
+        # [H5] 从持仓字段推算实际平仓量，不硬编码 0.5
+        # _on_tp1_filled 调用此方法前已更新 contracts_remaining
+        contracts_closed = round(
+            position.contracts_total - position.contracts_remaining, 4
+        )
+        close_pct = round(contracts_closed / position.contracts_total * 100, 1) if position.contracts_total > 0 else 50.0
         event = {
             "timestamp": datetime.now().isoformat(),
             "event": "tp1_filled",
             "trade_id": position.trade_id,
             "direction": position.direction,
             "tp1_price": position.tp1,
-            "contracts_closed": round(
-                position.contracts_total * 0.5, 4
-            ),
+            "contracts_closed": contracts_closed,
             "contracts_remaining": position.contracts_remaining,
+            "tp1_pnl": round(position.tp1_pnl, 4),
         }
         self._write(event)
         logger.info(
             f"[TLOG] TP1 成交 @ {position.tp1:.2f} | "
-            f"平仓50% 剩余:{position.contracts_remaining:.4f} 张"
+            f"平仓{close_pct:.0f}% ({contracts_closed:.4f}张) "
+            f"剩余:{position.contracts_remaining:.4f}张 "
+            f"TP1 PnL:{position.tp1_pnl:+.4f} USDT"
         )
 
     def log_close(

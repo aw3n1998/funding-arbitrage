@@ -105,6 +105,9 @@ class PO3Bot:
             logger.error(f"市场加载失败: {e}")
             return
 
+        # [L4] 启动时检查交易所是否有未管理的持仓（程序意外重启保护）
+        await self._check_existing_positions()
+
         # 获取初始权益（[BUG10] 失败不使用默认值，只记录 warning）
         equity = await self._fetch_equity()
         if equity is not None:
@@ -142,8 +145,12 @@ class PO3Bot:
         等待 15m K 线收盘事件。
         每次收盘运行 Accumulation → Manipulation 检测。
         """
-        # 等待 DataFeed 初始化完成
+        # [M4] 等待 DataFeed 初始化，最多等 5 分钟（防止静默空跑）
+        deadline = asyncio.get_event_loop().time() + 300
         while self._running and not self.feed.is_ready:
+            if asyncio.get_event_loop().time() > deadline:
+                logger.error("[15M] DataFeed 初始化超时（5分钟），请检查网络和 API Key")
+                return
             await asyncio.sleep(1)
         logger.info("[15M] 数据就绪，开始监听 15m K线收盘")
 
@@ -220,7 +227,12 @@ class PO3Bot:
         等待 1m K 线收盘事件。
         仅在有 Manipulation 信号时检测入场。
         """
+        # [M4] 等待 DataFeed 初始化，最多等 5 分钟
+        deadline = asyncio.get_event_loop().time() + 300
         while self._running and not self.feed.is_ready:
+            if asyncio.get_event_loop().time() > deadline:
+                logger.error("[1M] DataFeed 初始化超时（5分钟），请检查网络和 API Key")
+                return
             await asyncio.sleep(1)
         logger.info("[1M] 数据就绪，开始监听 1m K线收盘")
 
@@ -250,10 +262,19 @@ class PO3Bot:
                 await asyncio.sleep(2)
 
     async def _on_1m_close(self) -> None:
-        """1m 收盘时的入场检测逻辑"""
+        """
+        1m 收盘时的入场检测逻辑。
+
+        [C2] 重构执行顺序：
+          1. 检查 Manipulation 有效期（纯本地，无 API）
+          2. 获取 K 线 + 检测信号（纯本地，无 API）
+          3. 只有出现信号时才查权益（减少 API 调用频率）
+          4. 权益 API 失败时只跳过本根 K 线，不清除候信状态
+             （防止网络抖动丢失整个 Manipulation 窗口）
+        """
         manip = self._current_manip
 
-        # Manipulation 有效窗口：超过 manip_max_age_bars × 15min 放弃
+        # ── 1. Manipulation 有效期检查（无 API）──
         age_secs = (datetime.now() - manip.timestamp).total_seconds()
         max_age_secs = self.cfg.manip_max_age_bars * 15 * 60
         if age_secs > max_age_secs:
@@ -263,20 +284,11 @@ class PO3Bot:
             )
             return
 
-        # [BUG10] 风控检查：权益获取失败则拒绝
-        equity = await self._fetch_equity()
-        can, reason = self.risk.can_trade(equity)
-        if not can:
-            self.tlog.log_signal_rejected(reason, self.cfg.symbol)
-            self._clear_manipulation(f"风控拒绝: {reason}")
-            return
-
-        # 拉取已收盘 1m K 线
+        # ── 2. 信号检测（纯本地计算，无 API）──
         df_1m = self.feed.get_df_1m()
         if len(df_1m) < 5:
             return
 
-        # 检测入场信号
         signal = self.detector.detect_entry_signal(df_1m, manip)
         if signal is None:
             logger.debug("[1M] 等待入场信号...")
@@ -285,7 +297,20 @@ class PO3Bot:
         logger.info(f"[1M] 入场信号确认: {signal}")
         self.tlog.log_po3_phase("distribution", str(signal), self.cfg.symbol)
 
-        # 执行入场
+        # ── 3. 有信号时才查权益（[C2] 降低 API 调用频率）──
+        equity = await self._fetch_equity()
+        can, reason = self.risk.can_trade(equity)
+        if not can:
+            self.tlog.log_signal_rejected(reason, self.cfg.symbol)
+            # [C2] 权益 API 失败只跳过本次，保留候信状态等待下根 K 线重试
+            if equity is None:
+                logger.warning("[1M] 权益获取失败，跳过本次信号（候信状态保留）")
+                return
+            # 真实风控限制（次数/亏损上限）才清除候信
+            self._clear_manipulation(f"风控拒绝: {reason}")
+            return
+
+        # ── 4. 执行入场 ──
         atr = PO3Detector.get_current_atr(df_1m)
         success = await self.executor.enter(signal, equity, atr)
 
@@ -337,10 +362,45 @@ class PO3Bot:
     # ──────────────────── 状态打印循环 ────────────────────
 
     async def _loop_status(self) -> None:
-        """每 60s 打印一次机器人状态"""
+        """
+        每 60s 打印一次机器人状态。
+        [H4] 日切时自动记录前一交易日汇总。
+        [L2] 检查 WS 流健康状态，超过 2 分钟无数据时告警。
+        """
+        from datetime import date as _date
+        _last_date = _date.today()
+
         while self._running:
             try:
                 await asyncio.sleep(60)
+
+                # [H4] 日切检测：在 RiskManager 重置前抓取昨日统计
+                today = _date.today()
+                if today != _last_date:
+                    snap = self.risk.daily_stats_snapshot()
+                    equity = await self._fetch_equity()
+                    if equity and snap["start_equity"] > 0:
+                        pnl_pct = (equity - snap["start_equity"]) / snap["start_equity"]
+                        self.tlog.log_daily_summary(snap["trades"], equity, pnl_pct)
+                        logger.info(
+                            f"[STATUS] 日切汇总 {snap['date']} | "
+                            f"交易:{snap['trades']}次 胜:{snap['wins']}次 | "
+                            f"日PnL:{pnl_pct*100:+.2f}% | 权益:{equity:.2f} USDT"
+                        )
+                    _last_date = today
+
+                # [L2] WS 健康检测
+                health = self.feed.ws_health()
+                if health["1m_stale_secs"] > 120:
+                    logger.warning(
+                        f"[WS] ⚠ 1m 流超过 {health['1m_stale_secs']:.0f}s 无数据，"
+                        "连接可能已假活，等待自动重连"
+                    )
+                if health["ticker_stale_secs"] > 30:
+                    logger.warning(
+                        f"[WS] ⚠ Ticker 流超过 {health['ticker_stale_secs']:.0f}s 无数据"
+                    )
+
                 await self._print_status()
             except asyncio.CancelledError:
                 break
@@ -355,18 +415,22 @@ class PO3Bot:
 
         if pos:
             if price > 0:
+                # [H2] TP1 成交后只有 contracts_remaining 在持仓，未实现盈亏用该值
+                contracts_now = pos.contracts_remaining
                 if pos.direction == "long":
-                    unreal = (price - pos.entry_price) * pos.contracts_total
+                    unreal = (price - pos.entry_price) * contracts_now
                 else:
-                    unreal = (pos.entry_price - price) * pos.contracts_total
+                    unreal = (pos.entry_price - price) * contracts_now
             else:
                 unreal = 0.0
             holding_min = (datetime.now() - pos.opened_at).total_seconds() / 60
+            tp1_str = f" TP1已锁:{pos.tp1_pnl:+.2f}" if pos.tp1_pnl != 0 else ""
             logger.info(
-                f"[STATUS] {pos.direction.upper()} {pos.contracts_total:.4f}张 @ "
+                f"[STATUS] {pos.direction.upper()} {pos.contracts_remaining:.4f}张 @ "
                 f"{pos.entry_price:.2f} | 现价:{price:.2f} | "
-                f"未实现:{unreal:+.4f} USDT | SL:{pos.stop_loss:.2f} | "
-                f"持仓:{holding_min:.1f}min | 状态:{self.executor.state.value}"
+                f"未实现:{unreal:+.4f} USDT{tp1_str} | "
+                f"SL:{pos.stop_loss:.2f} | 持仓:{holding_min:.1f}min | "
+                f"状态:{self.executor.state.value}"
             )
         else:
             manip_str = f"候信({self._current_manip.bias})" if self._current_manip else "扫描中"
@@ -383,6 +447,35 @@ class PO3Bot:
         """等待事件并自动清除（避免调用方忘记 clear）"""
         await event.wait()
         event.clear()
+
+    async def _check_existing_positions(self) -> None:
+        """
+        [L4] 启动时检查交易所是否有未被机器人管理的持仓。
+        程序意外重启后（OOM、服务器重启等），已开仓位仍在交易所但内存状态已丢失。
+        检测到未管理持仓时打印 critical 告警，不自动平仓（避免误操作）。
+        """
+        if self.dry_run:
+            return
+        try:
+            positions = await self.exchange.fetch_positions([self.cfg.symbol])
+            open_pos = [
+                p for p in positions
+                if abs(float(p.get("contracts") or 0)) > 0
+            ]
+            if open_pos:
+                for p in open_pos:
+                    logger.critical(
+                        f"[BOT] ⚠ 发现未管理持仓！"
+                        f"symbol={p.get('symbol')} "
+                        f"side={p.get('side')} "
+                        f"contracts={p.get('contracts')} "
+                        f"entry={p.get('entryPrice')} | "
+                        f"请先手动处理后再运行机器人，或忽略继续（机器人不会自动管理此仓位）"
+                    )
+            else:
+                logger.info("[BOT] 启动检查：无未管理持仓，一切正常")
+        except Exception as e:
+            logger.debug(f"[BOT] 启动持仓检查失败（非致命）: {e}")
 
     async def _fetch_equity(self):
         """
